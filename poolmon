@@ -391,7 +391,14 @@ sub disable_host {
     my $host = shift || return;
     my $sock = director_connect() || return;
     print $sock "HOST-DOWN\t$host\n";
-    print $sock "HOST-FLUSH\t$host\n";
+    if (readline($sock) eq "OK\n") {
+        print $sock "HOST-FLUSH\t$host\n";
+        if (readline($sock) ne "OK\n") {
+            write_err("Failed to flush $host");
+        }
+    } else {
+        write_err("Failed to mark $host as down");
+    }
     close($sock);
     undef($sock);
     write_log("$host disabled");
@@ -402,6 +409,9 @@ sub enable_host {
     my $host = shift || return;
     my $sock = director_connect() || return;
     print $sock "HOST-UP\t$host\n";
+    if (readline($sock) ne "OK\n") {
+        write_err("Failed to mark $host as up");
+    }
     close($sock);
     undef($sock);
     write_log("$host enabled");
