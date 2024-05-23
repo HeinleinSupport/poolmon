@@ -26,7 +26,7 @@
 use strict;
 use Getopt::Long;
 use IO::Socket::UNIX;
-use IO::Socket::INET6;
+use IO::Socket::SSL;
 use POSIX qw(setsid strftime);
 use Sys::Syslog qw( :DEFAULT setlogsock);
 use Net::DNS;
@@ -256,19 +256,19 @@ sub scan_port {
     my $port         = shift || return;
     my $ssl          = shift;
     my $ssl_hostname = shift;
-    my $sock = $ssl ? IO::Socket::SSL : IO::Socket::INET6;
     my $prot;
     my $ret;
 
     #$IO::Socket::SSL::DEBUG = 3;
 
     ($port, $prot) = get_port_proto($port);
-    $sock = $sock->new(PeerAddr => $host,
-                       PeerPort => $port,
-                       Timeout  => $TIMEOUT,
-	               SSL_verify_mode => 1,
-		       SSL_verifycn_scheme => 'imap',
-		       SSL_verifycn_name => $ssl_hostname);
+    my $sock = IO::Socket::SSL->new(PeerAddr => $host,
+                                    PeerPort => $port,
+                                    Timeout  => $TIMEOUT,
+		                    SSL_startHandshake => $ssl,
+	                            SSL_verify_mode => 1,
+		                    SSL_verifycn_scheme => 'imap',
+		                    SSL_verifycn_name => $ssl_hostname);
     if ($@) {
         write_err("Socket creation failed for $host: $@");
     }
@@ -309,15 +309,24 @@ sub scan_imap {
     my $port = shift || return;
     my $sock = shift || return;
     my $line = readline($sock);
-    if ($line =~ m/LOGINDISABLED/){
+    if ($line =~ m/LOGINDISABLED/ && $line !~ m/STARTTLS/){
         write_err("$host:$port IMAP Server Reports Plaintext Login Disabled - check login_trusted_networks");
         return 1;
     } elsif ($line =~ m/^\* OK/){
         if ($USERNAME && $PASSWORD){
-            printf $sock "01 LOGIN %s {%d}\r\n%s\r\n", $USERNAME, length($PASSWORD), $PASSWORD;
+	    if ($line =~ m/STARTTLS/){
+                printf $sock "01 STARTTLS\r\n";
+		my $reply = readline($sock);
+		unless ($reply =~ m/^01 OK/) {
+                    $DEBUG && write_log("$host:$port TLS negotiation failed");
+		    return 0;
+	        }
+		$sock->connect_SSL;
+            }
+            printf $sock "02 LOGIN %s {%d}\r\n%s\r\n", $USERNAME, length($PASSWORD), $PASSWORD;
             my $literal = readline($sock);
             my $logstat = readline($sock);
-            if ($literal =~ m/^\+ OK/ && $logstat =~ m/^01 OK/){
+            if ($literal =~ m/^\+ OK/ && $logstat =~ m/^02 OK/){
                 $DEBUG && write_log("$host:$port IMAP Login OK");
                 return 1;
             } else {
