@@ -29,6 +29,7 @@ use IO::Socket::UNIX;
 use IO::Socket::INET6;
 use POSIX qw(setsid strftime);
 use Sys::Syslog qw( :DEFAULT setlogsock);
+use Net::DNS;
 
 $SIG{'PIPE'} = 'IGNORE';
 
@@ -202,12 +203,28 @@ sub director_connect {
 sub scan_host {
     my ($host, $updown) = @_;
     my $OK = 1;
+    my $hostname;
+    my $resolver = Net::DNS::Resolver->new();
+    my $query = $resolver->send($host, "PTR");
+    if ($query) {
+        foreach my $rr ($query->answer) {
+            if (defined $hostname) {
+                $DEBUG && write_log("Multiple PTR records for $host. Ignoring all but one.");
+	        last;
+            }
+	    # Remove trailing .
+            $hostname = substr($rr->rdatastr, 0, -1);
+	}
+    }
+    else {
+        $DEBUG && write_log("PTR lookup failure for $host");
+    }
     # Check non-SSL ports first
     foreach my $port (@PORTS){
-        if (! scan_port($host, $port, 0)){
+        if (! scan_port($host, $port, 0, $hostname)){
             sleep(3);
             for (my $i=0; $i <= 3; $i++) {
-                if (! scan_port($host, $port, 0)){
+                if (! scan_port($host, $port, 0, $hostname)){
                     $OK = 0;
                     last;
                 }
@@ -218,10 +235,10 @@ sub scan_host {
     # Skip SSL checks if standard checks indicated failure
     return 0 unless $OK;
     foreach my $port (@SSL_PORTS){
-        if (! scan_port($host, $port, 1)){
+        if (! scan_port($host, $port, 1, $hostname)){
             sleep(3);
             for (my $i=0; $i <= 3; $i++) {
-                if (! scan_port($host, $port, 1)){
+                if (! scan_port($host, $port, 1, $hostname)){
                     $OK = 0;
                     last;
                 }
@@ -235,18 +252,26 @@ sub scan_host {
 # Check a port on a host, with optional SSL and login
 sub scan_port {
     no strict 'subs';
-    my $host = shift || return;
-    my $port = shift || return;
-    my $ssl  = shift;
+    my $host         = shift || return;
+    my $port         = shift || return;
+    my $ssl          = shift;
+    my $ssl_hostname = shift;
     my $sock = $ssl ? IO::Socket::SSL : IO::Socket::INET6;
     my $prot;
     my $ret;
+
+    #$IO::Socket::SSL::DEBUG = 3;
 
     ($port, $prot) = get_port_proto($port);
     $sock = $sock->new(PeerAddr => $host,
                        PeerPort => $port,
                        Timeout  => $TIMEOUT,
-                       SSL_verify_mode => 1);
+	               SSL_verify_mode => 1,
+		       SSL_verifycn_scheme => 'imap',
+		       SSL_verifycn_name => $ssl_hostname);
+    if ($@) {
+        write_err("Socket creation failed for $host: $@");
+    }
 
     $ret = eval {
         local $SIG{ALRM} = sub {
