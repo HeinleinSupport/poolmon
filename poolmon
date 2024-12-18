@@ -35,6 +35,7 @@ $SIG{'PIPE'} = 'IGNORE';
 
 my @PORTS;
 my @SSL_PORTS;
+my $SSL_VERIFY = 1;
 my $DEBUG    = 0;
 my $NOFORK   = 0;
 my $DRY_RUN  = 0;
@@ -54,6 +55,7 @@ my $LMTP_TO = '';
 Getopt::Long::Configure("bundling");
 GetOptions('p|port=s'     => \@PORTS,
            's|ssl=s'      => \@SSL_PORTS,
+           'v|ssl_verify=i'      => \$SSL_VERIFY,
            'd|debug'      => \$DEBUG,
            't|timeout=i'  => \$TIMEOUT,
            'l|logfile=s'  => \$LOGFILE,
@@ -118,6 +120,7 @@ Arguments:
   -l, --logfile=PATH    Log file location (default: /var/log/poolmon.log)
                         Set to 'syslog' for writing to local syslog socket
   -p, --port=PORT       Port to check; repeat for multiple (default: 110, 143)
+  -v  --ssl_verify=(0|1) Set to 1 to enable, 0 to disable SSL_VERIFY
   -s  --ssl=PORT        Port with SSL/TLS; repeat for multiple (default: none)
                         If the port is recognized as common IMAP or POP3 port,
                         health checks will look for a valid connect banner.
@@ -175,8 +178,10 @@ sub scan_host_loop {
         $DEBUG && write_log("Scan of host $host with status $updown by PID $pid exited with status $OK");
         if ($OK) { # Enable host if currently disabled (updown=D)
             enable_host($host) if $updown eq "D";
+            $DEBUG && write_log("Set host $host to enabled");
         } else {  # Disable host if currently enabled (updown=U)
             disable_host($host) if $updown eq "U";
+            $DEBUG && write_log("Set host $host to disabled");
         }
         undef($CHILDREN{$pid});
     }
@@ -266,7 +271,7 @@ sub scan_port {
                                     PeerPort => $port,
                                     Timeout  => $TIMEOUT,
 		                    SSL_startHandshake => $ssl,
-	                            SSL_verify_mode => 1,
+	                            SSL_verify_mode => $SSL_VERIFY,
 		                    SSL_verifycn_scheme => 'imap',
 		                    SSL_verifycn_name => $ssl_hostname);
     if ($@) {
