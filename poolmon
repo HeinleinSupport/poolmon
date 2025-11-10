@@ -55,7 +55,7 @@ my $LMTP_TO = '';
 Getopt::Long::Configure("bundling");
 GetOptions('p|port=s'     => \@PORTS,
            's|ssl=s'      => \@SSL_PORTS,
-           'v|ssl_verify=i'      => \$SSL_VERIFY,
+           'v|ssl-verify=i'      => \$SSL_VERIFY,
            'd|debug'      => \$DEBUG,
            't|timeout=i'  => \$TIMEOUT,
            'l|logfile=s'  => \$LOGFILE,
