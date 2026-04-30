@@ -24,6 +24,8 @@
 ###
 
 use strict;
+use warnings;
+use Fcntl qw(:flock);
 use Getopt::Long;
 use IO::Socket::UNIX;
 use IO::Socket::SSL;
@@ -43,6 +45,7 @@ my $TIMEOUT  = 5;
 my $INTERVAL = 30;
 my $PIDOPEN  = 0;
 my $ORIGPID  = 0;
+my $PIDFH;
 my $PIDFILE  = '/var/run/poolmon.pid';
 my $LOGFILE  = '/var/log/poolmon.log';
 my $DIRECTOR = '/var/run/dovecot/director-admin';
@@ -228,13 +231,15 @@ sub scan_host {
     foreach my $port (@PORTS){
         if (! scan_port($host, $port, 0, $hostname)){
             sleep(3);
-            for (my $i=0; $i <= 3; $i++) {
-                if (! scan_port($host, $port, 0, $hostname)){
-                    $OK = 0;
+            my $retry_ok = 0;
+            for (my $i = 0; $i < 4; $i++) {
+                select(undef, undef, undef, 0.5) if $i > 0;
+                if (scan_port($host, $port, 0, $hostname)){
+                    $retry_ok = 1;
                     last;
                 }
-                sleep(0.5);
-           }
+            }
+            $OK = 0 unless $retry_ok;
         }
     }
     # Skip SSL checks if standard checks indicated failure
@@ -242,13 +247,15 @@ sub scan_host {
     foreach my $port (@SSL_PORTS){
         if (! scan_port($host, $port, 1, $hostname)){
             sleep(3);
-            for (my $i=0; $i <= 3; $i++) {
-                if (! scan_port($host, $port, 1, $hostname)){
-                    $OK = 0;
+            my $retry_ok = 0;
+            for (my $i = 0; $i < 4; $i++) {
+                select(undef, undef, undef, 0.5) if $i > 0;
+                if (scan_port($host, $port, 1, $hostname)){
+                    $retry_ok = 1;
                     last;
                 }
-                sleep(0.5);
-           }
+            }
+            $OK = 0 unless $retry_ok;
         }
     }
     return $OK;
@@ -396,8 +403,8 @@ sub scan_lmtp {
             }
 
             printf $sock "RCPT TO:<%s>\r\n", $LMTP_TO;
-            my $mailreply = readline($sock);
-            if ($mailreply !~ m/^2\d\d /){
+            my $rcptreply = readline($sock);
+            if ($rcptreply !~ m/^2\d\d /){
                 write_err("$host:$port LMTP Server Rejects recipient address");
                 return 0;
             }
@@ -502,19 +509,29 @@ sub write_to_syslog {
     return 1;
 }
 
-# Check to see if the pidfile exists and the indicated pid is still running
+# Check to see if the pidfile exists and the indicated pid is still running.
+# Opens and exclusively locks the pidfile, leaving $PIDFH open to hold the lock.
 sub check_pidfile {
-    if (-e $PIDFILE){
-        my $FH;
-        open($FH, "<$PIDFILE");
-        my $oldpid = readline($FH);
-        close($FH);
+    open($PIDFH, '+>>', $PIDFILE) or die "Can't open pidfile $PIDFILE: $!";
+    unless (flock($PIDFH, LOCK_EX|LOCK_NB)) {
+        seek($PIDFH, 0, 0);
+        my $oldpid = readline($PIDFH);
+        chomp $oldpid if defined $oldpid;
+        write_err("Already running as pid $oldpid");
+        exit(1);
+    }
+    # Also check PID content in case a prior run didn't use flock
+    seek($PIDFH, 0, 0);
+    my $oldpid = readline($PIDFH);
+    if (defined $oldpid) {
         chomp $oldpid;
-        if (kill(0, $oldpid)){
+        if ($oldpid =~ /^\d+$/ && kill(0, $oldpid)) {
             write_err("Already running as pid $oldpid");
             exit(1);
         }
     }
+    truncate($PIDFH, 0);
+    seek($PIDFH, 0, 0);
 }
 
 # Remove the pidfile and exit
@@ -523,6 +540,7 @@ sub remove_pidfile {
     if ($$ == $ORIGPID) {
         write_log('Shutting down');
         unlink($PIDFILE);
+        close($PIDFH);
     }
 }
 
@@ -541,9 +559,10 @@ sub load_credentials {
     return unless $CREDFILE;
     # Check permissions on credentials file
     if ((stat($CREDFILE))[2] & 077){
-        write_err("You should really chmod 600 $CREDFILE");
+        write_err("Credential file $CREDFILE must be chmod 600");
+        exit(1);
     }
-    if(open(my $credfh, "<$CREDFILE")){
+    if(open(my $credfh, '<', $CREDFILE)){
         $USERNAME = readline($credfh);
         $PASSWORD = readline($credfh);
         close($credfh);
@@ -563,11 +582,9 @@ sub load_credentials {
 
 # Fork into background and write pidfile
 sub daemonize {
-    my $FH;
-
-    # Open pidfile and register cleanup handlers
-    # Do this before forking so we can abort on failure
-    $PIDOPEN = open($FH, ">$PIDFILE") or die "Can't open pidfile $PIDFILE: $!";
+    # PID file already opened and locked in check_pidfile()
+    # Register cleanup handlers before forking
+    $PIDOPEN = 1;
     $SIG{'INT'} = sub {
         $DEBUG && write_log("Caught signal INT");
         remove_pidfile();
@@ -583,27 +600,26 @@ sub daemonize {
 
     # Disconnect from terminal and session
     chdir('/')         or die "Can't chdir to /: $!";
-    umask(0);
-    open(STDIN, '</dev/null')  or die "Can't read /dev/null: $!";
+    umask(0022);
+    open(STDIN, '<', '/dev/null')  or die "Can't read /dev/null: $!";
     if ($LOGFILE ne "syslog") {
-        open(STDOUT, ">>$LOGFILE") or die "Can't write to $LOGFILE: $!";
-        open(STDERR, ">>$LOGFILE") or die "Can't write to $LOGFILE: $!";
+        open(STDOUT, '>>', $LOGFILE) or die "Can't write to $LOGFILE: $!";
+        open(STDERR, '>>', $LOGFILE) or die "Can't write to $LOGFILE: $!";
     }
     defined(my $pid = fork())  or die "Can't fork: $!";
     $pid && exit(0);
     setsid()           or die "Can't start a new session: $!";
 
-    # Write forked PID to pidfile and startup message to log
+    # Write forked PID to pidfile; keep $PIDFH open to maintain exclusive lock
     write_log("Forked to background as PID $$");
-    print $FH "$$\n";
-    close($FH);
+    print $PIDFH "$$\n";
     $ORIGPID = $$;
 
     # Reopen logfiles on HUP
     $SIG{'HUP'} = sub {
         if ($LOGFILE ne "syslog") {
-          open(STDOUT, ">>$LOGFILE") or die "Can't reopen $LOGFILE: $!";
-          open(STDERR, ">>$LOGFILE") or die "Can't reopen $LOGFILE: $!";
+          open(STDOUT, '>>', $LOGFILE) or die "Can't reopen $LOGFILE: $!";
+          open(STDERR, '>>', $LOGFILE) or die "Can't reopen $LOGFILE: $!";
         }
         write_log("Logfile reopened");
         load_credentials();
