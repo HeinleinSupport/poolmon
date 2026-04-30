@@ -85,6 +85,25 @@ unless($NOFORK){
     my $ofh = select STDOUT;
     $| = 1;
     select $ofh;
+
+    # Set up PID file and signal handlers for foreground mode
+    $PIDOPEN = 1;
+    $ORIGPID = $$;
+    print $PIDFH "$$\n";
+    $SIG{'INT'} = sub {
+        $DEBUG && write_log("Caught signal INT");
+        remove_pidfile();
+        exit(0);
+    };
+    $SIG{'TERM'} = sub {
+        $DEBUG && write_log("Caught signal TERM");
+        remove_pidfile();
+        exit(0);
+    };
+    $SIG{'HUP'} = sub {
+        write_log("Reloading credentials");
+        load_credentials();
+    };
 }
 
 while(1){
@@ -116,7 +135,7 @@ Arguments:
   -l, --logfile=PATH    Log file location (default: /var/log/poolmon.log)
                         Set to 'syslog' for writing to local syslog socket
   -p, --port=PORT       Port to check; repeat for multiple (default: 110, 143)
-  -v  --ssl_verify=(0|1) Set to 1 to enable, 0 to disable SSL_VERIFY
+  -v  --ssl-verify=(0|1) Set to 1 to enable, 0 to disable SSL_VERIFY
   -s  --ssl=PORT        Port with SSL/TLS; repeat for multiple (default: none)
                         If the port is recognized as common IMAP or POP3 port,
                         health checks will look for a valid connect banner.
@@ -269,12 +288,13 @@ sub scan_port {
 
     ($port, $prot) = get_port_proto($port);
     my $verify_mode = $SSL_VERIFY ? IO::Socket::SSL::SSL_VERIFY_PEER() : IO::Socket::SSL::SSL_VERIFY_NONE();
+    my $cn_scheme = ($prot eq 'IMAP') ? 'imap' : ($prot eq 'POP3') ? 'pop3' : 'none';
     my $sock = IO::Socket::SSL->new(PeerAddr => $host,
                                     PeerPort => $port,
                                     Timeout  => $TIMEOUT,
                                     SSL_startHandshake => $ssl,
                                     SSL_verify_mode => $verify_mode,
-                                    SSL_verifycn_scheme => 'imap',
+                                    SSL_verifycn_scheme => $cn_scheme,
                                     SSL_verifycn_name => $ssl_hostname);
     if ($@) {
         write_err("Socket creation failed for $host: $@");
@@ -392,6 +412,17 @@ sub scan_lmtp {
     my $sock = shift || return;
     my $line = readline($sock);
     if ($line =~ m/^2\d\d /){
+        # Send LHLO greeting before any commands
+        printf $sock "LHLO %s\r\n", "poolmon";
+        my $lhloreply = readline($sock);
+        if ($lhloreply !~ m/^2\d\d/){
+            write_err("$host:$port LMTP LHLO rejected");
+            return 0;
+        }
+        # Read any continuation lines (multi-line response)
+        while ($lhloreply =~ m/^2\d\d-/) {
+            $lhloreply = readline($sock);
+        }
         if ($LMTP_TO){
             printf $sock "MAIL FROM:<%s>\r\n", $LMTP_FROM;
             my $mailreply = readline($sock);
@@ -423,14 +454,17 @@ sub scan_lmtp {
 sub get_port_proto {
     my $port = shift;
 
-    if ($port == 143 || $port == 993 || $port =~ m/IMAP:(\d+)/i){
-        $port = $1 ? $1 : $port;
+    if ($port =~ m/IMAP:(\d+)/i){
+        return $1, 'IMAP';
+    } elsif ($port =~ m/POP3:(\d+)/i){
+        return $1, 'POP3';
+    } elsif ($port =~ m/LMTP:(\d+)/i){
+        return $1, 'LMTP';
+    } elsif ($port == 143 || $port == 993){
         return $port, 'IMAP';
-    } elsif ($port == 110 || $port == 995 || $port =~ m/POP3:(\d+)/i){
-        $port = $1 ? $1 : $port;
+    } elsif ($port == 110 || $port == 995){
         return $port, 'POP3';
-    } elsif ($port == 24 || $port =~ m/LMTP:(\d+)/i){
-        $port = $1 ? $1 : $port;
+    } elsif ($port == 24){
         return $port, 'LMTP';
     } else {
         return $port, 'UNKNOWN';
@@ -456,9 +490,9 @@ sub disable_host {
         close($sock);
         undef($sock);
         write_log("$host disabled");
-      } else {
-          write_log("DRY-RUN: $host disabled");
-      }
+    } else {
+        write_log("DRY-RUN: $host disabled");
+    }
 }
 
 # Mark host as up
@@ -496,15 +530,20 @@ sub write_err {
     }
 }
 
-sub write_to_syslog {
-    my ($priority, $msg) = @_;
-    return 0 unless ($priority =~ /info|err|debug/);
+{
+    my $_syslog_opened = 0;
+    sub write_to_syslog {
+        my ($priority, $msg) = @_;
+        return 0 unless ($priority =~ /info|err|debug/);
 
-    setlogsock("unix");
-    openlog("poolmon", "pid,cons", "user");
-    syslog($priority, $msg);
-    closelog();
-    return 1;
+        unless ($_syslog_opened) {
+            setlogsock("unix");
+            openlog("poolmon", "pid,cons", "user");
+            $_syslog_opened = 1;
+        }
+        syslog($priority, "%s", $msg);
+        return 1;
+    }
 }
 
 # Check to see if the pidfile exists and the indicated pid is still running.
