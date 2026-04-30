@@ -27,8 +27,8 @@ use strict;
 use warnings;
 use Fcntl qw(:flock);
 use Getopt::Long;
-use IO::Socket::UNIX;
 use IO::Socket::SSL;
+use IO::Socket::UNIX;
 use POSIX qw(setsid strftime);
 use Sys::Syslog qw( :DEFAULT setlogsock);
 use Net::DNS;
@@ -75,13 +75,6 @@ GetOptions('p|port=s'     => \@PORTS,
 
 unless (@PORTS || @SSL_PORTS){
     @PORTS = qw(110 143);
-}
-
-if (@SSL_PORTS) {
-    eval("use IO::Socket::SSL;");
-    if ($@) {
-        die "$@";
-    }
 }
 
 check_pidfile();
@@ -164,6 +157,7 @@ sub scan_host_loop {
         if(my ($host, $weight, $clients, $tag, $updown) = split("\t", $line)){
             my $pid = fork();
             if ($pid == 0) {
+                close($PIDFH) if $PIDFH;
                 exit(scan_host($host, $updown));
             } elsif ($pid > 0) {
                 $CHILDREN{$pid} = [$host, $updown];
@@ -194,12 +188,13 @@ sub scan_host_loop {
 # Connect to local director and perform version handshake
 sub director_connect {
     my $HANDSHAKE = "VERSION\tdirector-doveadm\t1\t0\n";
-    my $sock = new IO::Socket::UNIX($DIRECTOR);
+    my $sock = IO::Socket::UNIX->new($DIRECTOR);
     if ($sock) {
         print $sock $HANDSHAKE;
         unless (readline($sock) eq $HANDSHAKE){
             write_err("Director handshake failed!");
             close($sock);
+            return undef;
         }
     } else {
         write_err("Failed to connect to director: $!");
@@ -263,7 +258,6 @@ sub scan_host {
 
 # Check a port on a host, with optional SSL and login
 sub scan_port {
-    no strict 'subs';
     my $host         = shift || return;
     my $port         = shift || return;
     my $ssl          = shift;
@@ -274,13 +268,14 @@ sub scan_port {
     #$IO::Socket::SSL::DEBUG = 3;
 
     ($port, $prot) = get_port_proto($port);
+    my $verify_mode = $SSL_VERIFY ? IO::Socket::SSL::SSL_VERIFY_PEER() : IO::Socket::SSL::SSL_VERIFY_NONE();
     my $sock = IO::Socket::SSL->new(PeerAddr => $host,
                                     PeerPort => $port,
                                     Timeout  => $TIMEOUT,
-		                    SSL_startHandshake => $ssl,
-	                            SSL_verify_mode => $SSL_VERIFY,
-		                    SSL_verifycn_scheme => 'imap',
-		                    SSL_verifycn_name => $ssl_hostname);
+                                    SSL_startHandshake => $ssl,
+                                    SSL_verify_mode => $verify_mode,
+                                    SSL_verifycn_scheme => 'imap',
+                                    SSL_verifycn_name => $ssl_hostname);
     if ($@) {
         write_err("Socket creation failed for $host: $@");
     }
@@ -291,25 +286,28 @@ sub scan_port {
             die "Timeout\n";
         };
         alarm $TIMEOUT;
+        my $result;
         if ($sock){
             if ($prot eq 'IMAP'){
-                return scan_imap($host, $port, $sock);
+                $result = scan_imap($host, $port, $sock);
             } elsif ($prot eq 'POP3'){
-                return scan_pop3($host, $port, $sock);
+                $result = scan_pop3($host, $port, $sock);
             } elsif ($prot eq 'LMTP'){
-                return scan_lmtp($host, $port, $sock);
+                $result = scan_lmtp($host, $port, $sock);
             } elsif (readline($sock)){
                 $DEBUG && write_log("$host:$port Connection OK");
-                return 1
+                $result = 1;
             }
         } else {
             $DEBUG && write_log("$host:$port Connection Failed");
-            return 0;
+            $result = 0;
         }
         alarm 0;
+        $result;
     };
 
     if ($@){
+        alarm 0;
         $DEBUG && write_log("$host:$port Read Timeout");
     }
 
@@ -588,14 +586,17 @@ sub daemonize {
     $SIG{'INT'} = sub {
         $DEBUG && write_log("Caught signal INT");
         remove_pidfile();
+        exit(0);
     };
     $SIG{'QUIT'} = sub {
         $DEBUG && write_log("Caught signal QUIT");
         remove_pidfile();
+        exit(0);
     };
     $SIG{'TERM'} = sub {
         $DEBUG && write_log("Caught signal TERM");
         remove_pidfile();
+        exit(0);
     };
 
     # Disconnect from terminal and session
