@@ -21,8 +21,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libio-socket-ssl-perl libnet-dns-perl
+          if ! command -v cpanm >/dev/null 2>&1; then
+            cpan App::cpanminus
+          fi
+          cpanm --notest Net::DNS IO::Socket::SSL
 
       - name: Perl syntax check
         run: perl -c poolmon
