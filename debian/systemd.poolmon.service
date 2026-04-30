@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 [Unit]
 Description=Poolmon monitors a pool of Dovecot director mailservers \
  and dynamically alters their state based on active health \

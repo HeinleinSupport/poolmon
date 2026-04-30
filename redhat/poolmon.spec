@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 Name: poolmon
 Version:  0.7
 Release:  1%{?dist}

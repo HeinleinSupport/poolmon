@@ -64,6 +64,7 @@ git shortlog -sne --all
 - Manu Zurmühl <m.zurmuehl@heinlein-support.de>
 - Mikal Sande <mikal.sande@altibox.no>
 - Timo Sirainen <timo.sirainen@dovecot.fi>
+- Mirko Ludeke <mludeke>
 
 ## Original Project and Fork Lineage
 

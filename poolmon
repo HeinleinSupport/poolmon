@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+# SPDX-License-Identifier: GPL-2.0-or-later
 # vim: ai ts=4 sts=4 et sw=4
 #
 # Director mailserver pool monitoring script, meant to roughly duplicate the
