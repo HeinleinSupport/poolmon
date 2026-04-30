@@ -1,0 +1,28 @@
+name: Perl CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  perl-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Perl
+        uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: "5.36"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libio-socket-ssl-perl libnet-dns-perl
+
+      - name: Perl syntax check
+        run: perl -c poolmon
