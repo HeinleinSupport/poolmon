@@ -77,6 +77,9 @@ unless (@PORTS || @SSL_PORTS){
     @PORTS = qw(110 143);
 }
 
+validate_port_options('--port', \@PORTS);
+validate_port_options('--ssl', \@SSL_PORTS);
+
 if ($TIMEOUT < 1) {
     write_err("Timeout must be at least 1 second");
     exit(1);
@@ -164,6 +167,26 @@ Arguments:
     exit(1);
 }
 
+sub validate_port_options {
+    my ($opt_name, $ports_ref) = @_;
+    foreach my $entry (@{$ports_ref}) {
+        my $port;
+        if ($entry =~ /^(?:IMAP|POP3|LMTP):(\d+)$/i) {
+            $port = $1;
+        } elsif ($entry =~ /^(\d+)$/) {
+            $port = $1;
+        } else {
+            write_err("Invalid $opt_name value '$entry': must be numeric or PROTO:PORT (IMAP|POP3|LMTP)");
+            exit(1);
+        }
+
+        if ($port < 1 || $port > 65535) {
+            write_err("Invalid $opt_name value '$entry': port must be in range 1-65535");
+            exit(1);
+        }
+    }
+}
+
 # Get list of mailservers from local director and scan them
 sub scan_host_loop {
     # Get mailserver list
@@ -186,7 +209,7 @@ sub scan_host_loop {
             my $pid = fork();
             if ($pid == 0) {
                 close($PIDFH) if $PIDFH;
-                exit(scan_host($host, $updown));
+                exit(scan_host($host));
             } elsif ($pid > 0) {
                 $CHILDREN{$pid} = [$host, $updown];
             } else {
@@ -236,9 +259,9 @@ sub director_connect {
 
 # Scan all ports on a given host. 1 == success. 0 == failure
 sub scan_host {
-    my ($host, $updown) = @_;
+    my ($host) = @_;
     my $OK = eval {
-        _scan_host_impl($host, $updown);
+        _scan_host_impl($host);
     };
     if ($@) {
         write_err("Unexpected error scanning $host: $@");
@@ -248,7 +271,7 @@ sub scan_host {
 }
 
 sub _scan_host_impl {
-    my ($host, $updown) = @_;
+    my ($host) = @_;
     my $OK = 1;
     my $hostname;
     my $resolver = Net::DNS::Resolver->new();
@@ -322,8 +345,9 @@ sub scan_port {
                                     SSL_verify_mode => $verify_mode,
                                     SSL_verifycn_scheme => $cn_scheme,
                                     SSL_verifycn_name => $ssl_hostname);
-    if ($@) {
-        write_err("Socket creation failed for $host: $@");
+    unless ($sock) {
+        my $ssl_err = IO::Socket::SSL::errstr() || $@ || 'unknown SSL socket error';
+        write_err("Socket creation failed for $host:$port: $ssl_err");
     }
 
     $ret = eval {
@@ -366,30 +390,34 @@ sub scan_imap {
     my $port = shift || return;
     my $sock = shift || return;
     my $line = readline($sock);
+    return 0 unless defined $line;
     if ($line =~ m/LOGINDISABLED/ && $line !~ m/STARTTLS/){
         write_err("$host:$port IMAP Server Reports Plaintext Login Disabled - check login_trusted_networks");
         return 1;
     } elsif ($line =~ m/^\* OK/){
         if ($USERNAME && $PASSWORD){
-	    if ($line =~ m/STARTTLS/){
+            if ($line =~ m/STARTTLS/){
                 printf $sock "01 STARTTLS\r\n";
-		my $reply = readline($sock);
-		unless ($reply =~ m/^01 OK/) {
+                my $reply = readline($sock);
+                unless (defined $reply && $reply =~ m/^01 OK/) {
                     $DEBUG && write_log("$host:$port TLS negotiation failed");
-		    return 0;
-	        }
-		$sock->connect_SSL;
+                    return 0;
+                }
+                unless ($sock->connect_SSL) {
+                    $DEBUG && write_log("$host:$port SSL upgrade failed");
+                    return 0;
+                }
             }
             printf $sock "02 LOGIN %s {%d}\r\n%s\r\n", $USERNAME, length($PASSWORD), $PASSWORD;
             my $literal = readline($sock);
             my $logstat = readline($sock);
-            if ($literal =~ m/^\+/ && $logstat =~ m/^02 OK/){
+            if (defined $literal && $literal =~ m/^\+/ && defined $logstat && $logstat =~ m/^02 OK/){
                 $DEBUG && write_log("$host:$port IMAP Login OK");
                 printf $sock "03 LOGOUT\r\n";
                 return 1;
             } else {
                 $DEBUG && write_log("$host:$port IMAP Login Failed");
-                $DEBUG && write_log("\t\t$logstat");
+                $DEBUG && write_log("\t\t" . ($logstat // '(no response)'));
                 printf $sock "03 LOGOUT\r\n";
                 return 0;
             }
@@ -409,10 +437,16 @@ sub scan_pop3 {
     my $port = shift || return;
     my $sock = shift || return;
     my $line = readline($sock);
+    return 0 unless defined $line;
     if ($line =~ m/\+OK/){
         if ($USERNAME && $PASSWORD){
             printf $sock "USER %s\r\n", $USERNAME;
             my $userval = readline($sock);
+            unless (defined $userval) {
+                $DEBUG && write_log("$host:$port POP3 USER command returned no response");
+                printf $sock "QUIT\r\n";
+                return 0;
+            }
             if ($userval =~ m/^-ERR Plaintext authentication disallowed/){
                 write_err("$host:$port POP3 Server Reports Plaintext Login Disabled - check login_trusted_networks");
                 printf $sock "QUIT\r\n";
@@ -420,6 +454,11 @@ sub scan_pop3 {
             } elsif ($userval =~ m/^\+OK/){
                 printf $sock "PASS %s\r\n", $PASSWORD;
                 my $logstat = readline($sock);
+                unless (defined $logstat) {
+                    $DEBUG && write_log("$host:$port POP3 PASS command returned no response");
+                    printf $sock "QUIT\r\n";
+                    return 0;
+                }
                 if ($logstat =~ m/^\+OK/){
                     $DEBUG && write_log("$host:$port POP3 Login OK");
                     printf $sock "QUIT\r\n";
@@ -452,29 +491,30 @@ sub scan_lmtp {
     my $port = shift || return;
     my $sock = shift || return;
     my $line = readline($sock);
-    if ($line =~ m/^2\d\d /){
+    return 0 unless defined $line;
+    if ($line =~ m/^2\d\d[ -]/){
         # Send LHLO greeting before any commands
         printf $sock "LHLO %s\r\n", "poolmon";
         my $lhloreply = readline($sock);
-        if ($lhloreply !~ m/^2\d\d/){
+        unless (defined $lhloreply && $lhloreply =~ m/^2\d\d/){
             write_err("$host:$port LMTP LHLO rejected");
             return 0;
         }
         # Read any continuation lines (multi-line response)
-        while ($lhloreply =~ m/^2\d\d-/) {
+        while (defined $lhloreply && $lhloreply =~ m/^2\d\d-/) {
             $lhloreply = readline($sock);
         }
         if ($LMTP_TO){
             printf $sock "MAIL FROM:<%s>\r\n", $LMTP_FROM;
             my $mailreply = readline($sock);
-            if ($mailreply !~ m/^2\d\d /){
+            unless (defined $mailreply && $mailreply =~ m/^2\d\d /){
                 write_err("$host:$port LMTP Server Rejects sender address");
                 return 0;
             }
 
             printf $sock "RCPT TO:<%s>\r\n", $LMTP_TO;
             my $rcptreply = readline($sock);
-            if ($rcptreply !~ m/^2\d\d /){
+            unless (defined $rcptreply && $rcptreply =~ m/^2\d\d /){
                 write_err("$host:$port LMTP Server Rejects recipient address");
                 return 0;
             }
@@ -665,6 +705,7 @@ sub daemonize {
     # PID file already opened and locked in check_pidfile()
     # Register cleanup handlers before forking
     $PIDOPEN = 1;
+    $ORIGPID = $$;
     $SIG{'INT'} = sub {
         $DEBUG && write_log("Caught signal INT");
         remove_pidfile();
@@ -690,13 +731,17 @@ sub daemonize {
         open(STDERR, '>>', $LOGFILE) or die "Can't write to $LOGFILE: $!";
     }
     defined(my $pid = fork())  or die "Can't fork: $!";
-    $pid && exit(0);
+    if ($pid) {
+        # Child process becomes the pidfile owner; parent exits without cleanup.
+        $PIDOPEN = 0;
+        exit(0);
+    }
+    $ORIGPID = $$;
     setsid()           or die "Can't start a new session: $!";
 
     # Write forked PID to pidfile; keep $PIDFH open to maintain exclusive lock
     write_log("Forked to background as PID $$");
     print $PIDFH "$$\n";
-    $ORIGPID = $$;
 
     # Reopen logfiles on HUP
     $SIG{'HUP'} = sub {

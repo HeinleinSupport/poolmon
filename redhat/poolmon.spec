@@ -1,5 +1,5 @@
 Name: poolmon
-Version:  0.6
+Version:  0.7
 Release:  1%{?dist}
 Summary: poolmon is a director mailserver pool monitoring script for Dovecot
 
@@ -14,6 +14,8 @@ BuildArch: noarch
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
 Requires: dovecot
 Requires: perl(IO::Socket::SSL)
+Requires: perl(Net::DNS)
+Requires: perl(Sys::Syslog)
 
 %description
 Poolmon is a director mailserver pool monitoring script for Dovecot, meant to
@@ -68,4 +70,3 @@ fi
 - Updated version to 0.4 with support for login checks by dfwarden@gmail.com
 * Thu Aug 19 2010 Brandon Davidson <brandond@uoregon.edu>
 - Initial Package 
-
