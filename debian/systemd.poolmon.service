@@ -9,6 +9,7 @@ Type=simple
 EnvironmentFile=-/etc/dovecot/poolmon.conf
 WorkingDirectory=/
 ExecStart=/usr/local/sbin/poolmon -f $OPTIONS
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 LimitNOFILE=10000
 
