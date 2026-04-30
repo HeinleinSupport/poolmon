@@ -77,6 +77,15 @@ unless (@PORTS || @SSL_PORTS){
     @PORTS = qw(110 143);
 }
 
+if ($TIMEOUT < 1) {
+    write_err("Timeout must be at least 1 second");
+    exit(1);
+}
+if ($INTERVAL < 1) {
+    write_err("Interval must be at least 1 second");
+    exit(1);
+}
+
 check_pidfile();
 unless($NOFORK){
     daemonize();
@@ -187,9 +196,13 @@ sub scan_host_loop {
     }
 
     # Take action based on check results returned by subprocesses
-    while(my $pid = wait()){
+    while(keys %CHILDREN){
+        my $pid = waitpid(-1, 0);
+        if ($pid == -1) {
+            last unless $!{EINTR};
+            next;
+        }
         my $OK = $? >> 8;
-        last if $pid == -1;
         my ($host, $updown) = @{$CHILDREN{$pid}};
         $DEBUG && write_log("Scan of host $host with status $updown by PID $pid exited with status $OK");
         if ($OK) { # Enable host if currently disabled (updown=D)
@@ -199,7 +212,7 @@ sub scan_host_loop {
             disable_host($host) if $updown eq "U";
             $DEBUG && write_log("Set host $host to disabled");
         }
-        undef($CHILDREN{$pid});
+        delete($CHILDREN{$pid});
     }
     $DEBUG && write_log('Host scans complete');
 }
@@ -224,19 +237,32 @@ sub director_connect {
 # Scan all ports on a given host. 1 == success. 0 == failure
 sub scan_host {
     my ($host, $updown) = @_;
+    my $OK = eval {
+        _scan_host_impl($host, $updown);
+    };
+    if ($@) {
+        write_err("Unexpected error scanning $host: $@");
+        return 0;
+    }
+    return $OK ? 1 : 0;
+}
+
+sub _scan_host_impl {
+    my ($host, $updown) = @_;
     my $OK = 1;
     my $hostname;
     my $resolver = Net::DNS::Resolver->new();
-    my $query = $resolver->send($host, "PTR");
-    if ($query) {
-        foreach my $rr ($query->answer) {
+    my $reply = $resolver->query($host);
+    if ($reply) {
+        foreach my $rr ($reply->answer) {
+            next unless $rr->type eq 'PTR';
             if (defined $hostname) {
                 $DEBUG && write_log("Multiple PTR records for $host. Ignoring all but one.");
-	        last;
+                last;
             }
-	    # Remove trailing .
+            # Remove trailing .
             $hostname = substr($rr->rdatastr, 0, -1);
-	}
+        }
     }
     else {
         $DEBUG && write_log("PTR lookup failure for $host");
@@ -331,6 +357,7 @@ sub scan_port {
         $DEBUG && write_log("$host:$port Read Timeout");
     }
 
+    close($sock) if $sock;
     return $ret;
 }
 
@@ -356,12 +383,14 @@ sub scan_imap {
             printf $sock "02 LOGIN %s {%d}\r\n%s\r\n", $USERNAME, length($PASSWORD), $PASSWORD;
             my $literal = readline($sock);
             my $logstat = readline($sock);
-            if ($literal =~ m/^\+ OK/ && $logstat =~ m/^02 OK/){
+            if ($literal =~ m/^\+/ && $logstat =~ m/^02 OK/){
                 $DEBUG && write_log("$host:$port IMAP Login OK");
+                printf $sock "03 LOGOUT\r\n";
                 return 1;
             } else {
                 $DEBUG && write_log("$host:$port IMAP Login Failed");
                 $DEBUG && write_log("\t\t$logstat");
+                printf $sock "03 LOGOUT\r\n";
                 return 0;
             }
         } else {
@@ -382,22 +411,34 @@ sub scan_pop3 {
     my $line = readline($sock);
     if ($line =~ m/\+OK/){
         if ($USERNAME && $PASSWORD){
-            printf $sock "USER %s\r\nPASS %s\r\n", $USERNAME, $PASSWORD;
+            printf $sock "USER %s\r\n", $USERNAME;
             my $userval = readline($sock);
-            my $logstat = readline($sock);
             if ($userval =~ m/^-ERR Plaintext authentication disallowed/){
                 write_err("$host:$port POP3 Server Reports Plaintext Login Disabled - check login_trusted_networks");
+                printf $sock "QUIT\r\n";
                 return 1;
-            } elsif ($userval =~ m/^\+OK/ && $logstat =~ m/^\+OK/){
-                $DEBUG && write_log("$host:$port POP3 Login OK");
-                return 1;
+            } elsif ($userval =~ m/^\+OK/){
+                printf $sock "PASS %s\r\n", $PASSWORD;
+                my $logstat = readline($sock);
+                if ($logstat =~ m/^\+OK/){
+                    $DEBUG && write_log("$host:$port POP3 Login OK");
+                    printf $sock "QUIT\r\n";
+                    return 1;
+                } else {
+                    $DEBUG && write_log("$host:$port POP3 Login Failed");
+                    $DEBUG && write_log("\t\t$logstat");
+                    printf $sock "QUIT\r\n";
+                    return 0;
+                }
             } else {
-                $DEBUG && write_log("$host:$port POP3 Login Failed");
-                $DEBUG && write_log("\t\t$logstat");
+                $DEBUG && write_log("$host:$port POP3 USER command failed");
+                $DEBUG && write_log("\t\t$userval");
+                printf $sock "QUIT\r\n";
                 return 0;
-        }
+            }
         } else {
             $DEBUG && write_log("$host:$port POP3 Banner OK");
+            printf $sock "QUIT\r\n";
             return 1;
         }
     } else {
@@ -439,9 +480,11 @@ sub scan_lmtp {
             }
 
             $DEBUG && write_log("$host:$port LMTP OK");
+            printf $sock "QUIT\r\n";
             return 1;
         } else {
             $DEBUG && write_log("$host:$port LMTP Banner OK");
+            printf $sock "QUIT\r\n";
             return 1;
         }
     } else {
