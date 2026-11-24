@@ -30,6 +30,7 @@ use Fcntl qw(:flock);
 use Getopt::Long;
 use IO::Socket::SSL;
 use IO::Socket::UNIX;
+use IO::Socket::SSL;
 use POSIX qw(setsid strftime);
 use Sys::Syslog qw( :DEFAULT setlogsock);
 use Net::DNS;
@@ -55,75 +56,81 @@ my $USERNAME = '';
 my $PASSWORD = '';
 my $LMTP_FROM = '';
 my $LMTP_TO = '';
+my $TLS_USE_HOSTNAME = 0;
 
-Getopt::Long::Configure("bundling");
-GetOptions('p|port=s'     => \@PORTS,
-           's|ssl=s'      => \@SSL_PORTS,
-           'v|ssl-verify=i'      => \$SSL_VERIFY,
-           'd|debug'      => \$DEBUG,
-           't|timeout=i'  => \$TIMEOUT,
-           'l|logfile=s'  => \$LOGFILE,
-           'k|lockfile=s' => \$PIDFILE,
-           'i|interval=i' => \$INTERVAL,
-           'f|foreground' => \$NOFORK,
-           'n|dry-run'    => \$DRY_RUN,
-           'S|socket=s'   => \$DIRECTOR,
-           'h|help|?'     => \&help,
-           'c|credfile=s' => \&opt_credfile,
-           'lmtp-from=s'  => \$LMTP_FROM,
-           'lmtp-to=s'    => \$LMTP_TO,
-    ) or help();
+sub main {
+    Getopt::Long::Configure("bundling");
+    GetOptions('p|port=s'     => \@PORTS,
+               's|ssl=s'      => \@SSL_PORTS,
+               'v|ssl-verify=i'      => \$SSL_VERIFY,
+               'd|debug'      => \$DEBUG,
+               't|timeout=i'  => \$TIMEOUT,
+               'l|logfile=s'  => \$LOGFILE,
+               'k|lockfile=s' => \$PIDFILE,
+               'i|interval=i' => \$INTERVAL,
+               'f|foreground' => \$NOFORK,
+               'n|dry-run'    => \$DRY_RUN,
+               'S|socket=s'   => \$DIRECTOR,
+               'h|help|?'     => \&help,
+               'c|credfile=s' => \&opt_credfile,
+               'lmtp-from=s'  => \$LMTP_FROM,
+               'lmtp-to=s'    => \$LMTP_TO,
+               'tls-use-hostname' => \$TLS_USE_HOSTNAME,
+        ) or help();
 
-unless (@PORTS || @SSL_PORTS){
-    @PORTS = qw(110 143);
+    unless (@PORTS || @SSL_PORTS){
+        @PORTS = qw(110 143);
+    }
+
+    validate_port_options('--port', \@PORTS);
+    validate_port_options('--ssl', \@SSL_PORTS);
+
+    if ($TIMEOUT < 1) {
+        write_err("Timeout must be at least 1 second");
+        exit(1);
+    }
+    if ($INTERVAL < 1) {
+        write_err("Interval must be at least 1 second");
+        exit(1);
+    }
+
+    check_pidfile();
+    unless($NOFORK){
+        daemonize();
+    } else {
+        # Disable buffering of stdout when running in foreground mode
+        my $ofh = select STDOUT;
+        $| = 1;
+        select $ofh;
+
+        # Set up PID file and signal handlers for foreground mode
+        $PIDOPEN = 1;
+        $ORIGPID = $$;
+        print $PIDFH "$$\n";
+        $SIG{'INT'} = sub {
+            $DEBUG && write_log("Caught signal INT");
+            remove_pidfile();
+            exit(0);
+        };
+        $SIG{'TERM'} = sub {
+            $DEBUG && write_log("Caught signal TERM");
+            remove_pidfile();
+            exit(0);
+        };
+        $SIG{'HUP'} = sub {
+            write_log("Reloading credentials");
+            load_credentials();
+        };
+    }
+
+    while(1){
+        scan_host_loop();
+        sleep($INTERVAL);
+    }
+    exit(0);
 }
 
-validate_port_options('--port', \@PORTS);
-validate_port_options('--ssl', \@SSL_PORTS);
-
-if ($TIMEOUT < 1) {
-    write_err("Timeout must be at least 1 second");
-    exit(1);
-}
-if ($INTERVAL < 1) {
-    write_err("Interval must be at least 1 second");
-    exit(1);
-}
-
-check_pidfile();
-unless($NOFORK){
-    daemonize();
-} else {
-    # Disable buffering of stdout when running in foreground mode
-    my $ofh = select STDOUT;
-    $| = 1;
-    select $ofh;
-
-    # Set up PID file and signal handlers for foreground mode
-    $PIDOPEN = 1;
-    $ORIGPID = $$;
-    print $PIDFH "$$\n";
-    $SIG{'INT'} = sub {
-        $DEBUG && write_log("Caught signal INT");
-        remove_pidfile();
-        exit(0);
-    };
-    $SIG{'TERM'} = sub {
-        $DEBUG && write_log("Caught signal TERM");
-        remove_pidfile();
-        exit(0);
-    };
-    $SIG{'HUP'} = sub {
-        write_log("Reloading credentials");
-        load_credentials();
-    };
-}
-
-while(1){
-    scan_host_loop();
-    sleep($INTERVAL);
-}
-exit(0);
+main() if $0 eq __FILE__;
 
 ### It's subroutines, all the way down.
 
@@ -161,6 +168,8 @@ Arguments:
                         (default: health checks will not attempt authentication)
   --lmtp-from=ADDR      Sender e-mail address for LMTP
   --lmtp-to=ADDR        Recipient e-mail address for LMTP
+  --tls-use-hostname    Connect to TLS ports using the PTR hostname and use it
+                        for SNI (default: connect using the director address)
   -S, --socket=PATH     Path to Dovecot director-admin socket
                         (default: /var/run/dovecot/director-admin)
   -t, --timeout=SECS    Port health check timeout in seconds (default: 5)
@@ -334,18 +343,24 @@ sub scan_port {
     my $prot;
     my $ret;
 
+    if ($TLS_USE_HOSTNAME && $ssl && !$ssl_hostname) {
+        write_err("$host:$port Cannot perform TLS check without a PTR hostname");
+        return 0;
+    }
+
     #$IO::Socket::SSL::DEBUG = 3;
 
     ($port, $prot) = get_port_proto($port);
     my $verify_mode = $SSL_VERIFY ? IO::Socket::SSL::SSL_VERIFY_PEER() : IO::Socket::SSL::SSL_VERIFY_NONE();
     my $cn_scheme = ($prot eq 'IMAP') ? 'imap' : ($prot eq 'POP3') ? 'pop3' : 'none';
-    my $sock = IO::Socket::SSL->new(PeerAddr => $host,
+    my $sock = IO::Socket::SSL->new(PeerAddr => $TLS_USE_HOSTNAME && $ssl ? $ssl_hostname : $host,
                                     PeerPort => $port,
                                     Timeout  => $TIMEOUT,
                                     SSL_startHandshake => $ssl,
                                     SSL_verify_mode => $verify_mode,
                                     SSL_verifycn_scheme => $cn_scheme,
-                                    SSL_verifycn_name => $ssl_hostname);
+                                    SSL_verifycn_name => $ssl_hostname,
+                                    ($TLS_USE_HOSTNAME && defined $ssl_hostname ? (SSL_hostname => $ssl_hostname) : ()));
     unless ($sock) {
         my $ssl_err = IO::Socket::SSL::errstr() || $@ || 'unknown SSL socket error';
         write_err("Socket creation failed for $host:$port: $ssl_err");
@@ -360,7 +375,7 @@ sub scan_port {
         my $result;
         if ($sock){
             if ($prot eq 'IMAP'){
-                $result = scan_imap($host, $port, $sock);
+                $result = scan_imap($host, $port, $sock, $ssl_hostname);
             } elsif ($prot eq 'POP3'){
                 $result = scan_pop3($host, $port, $sock);
             } elsif ($prot eq 'LMTP'){
@@ -390,6 +405,7 @@ sub scan_imap {
     my $host = shift || return;
     my $port = shift || return;
     my $sock = shift || return;
+    my $ssl_hostname = shift;
     my $line = readline($sock);
     return 0 unless defined $line;
     if ($line =~ m/LOGINDISABLED/ && $line !~ m/STARTTLS/){
@@ -398,6 +414,10 @@ sub scan_imap {
     } elsif ($line =~ m/^\* OK/){
         if ($USERNAME && $PASSWORD){
             if ($line =~ m/STARTTLS/){
+                if ($TLS_USE_HOSTNAME && !$ssl_hostname) {
+                    write_err("$host:$port Cannot perform STARTTLS without a PTR hostname");
+                    return 0;
+                }
                 printf $sock "01 STARTTLS\r\n";
                 my $reply = readline($sock);
                 unless (defined $reply && $reply =~ m/^01 OK/) {
@@ -405,7 +425,7 @@ sub scan_imap {
                     return 0;
                 }
                 unless ($sock->connect_SSL) {
-                    $DEBUG && write_log("$host:$port SSL upgrade failed");
+                    write_err("$host:$port TLS negotiation failed: " . IO::Socket::SSL::errstr());
                     return 0;
                 }
             }
@@ -759,3 +779,5 @@ sub daemonize {
 END {
     remove_pidfile();
 }
+
+1;

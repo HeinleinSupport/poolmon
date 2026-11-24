@@ -26,6 +26,10 @@ in node reachability can cause mailserver vhost count flapping.
 - Optional STARTTLS upgrade handling for IMAP with credential-based login.
 - Optional TLS certificate verification controls via `--ssl-verify`.
 - Optional PTR lookup for target hosts for TLS name verification context.
+- Optional `--tls-use-hostname` mode to connect to direct-TLS endpoints by
+  their PTR hostname and use it for certificate verification and SNI. This
+  mode requires a PTR hostname for each TLS check; STARTTLS continues to
+  connect to the director address before upgrading.
 - Automatic director actions on state changes:
   - `HOST-DOWN` + `HOST-FLUSH` for failed backends
   - `HOST-UP` for recovered backends
